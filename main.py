@@ -1,288 +1,224 @@
-import asyncio
-import logging
-import random
-import requests
 import os
-from datetime import datetime
+import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from openai import OpenAI
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+# 로깅 설정
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# 환경 변수에서 토큰과 API 키 가져오기
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHANNEL_ID = os.getenv('CHANNEL_ID', '@anju_nous_talk')  
+NOUS_API_KEY = os.getenv('NOUS_API_KEY')
 
-user_api_keys = {}
-
-class ChatBot:
-    def __init__(self, name, personality, emoji):
-        self.name = name
-        self.personality = personality
-        self.emoji = emoji
-    
-    def get_response(self, message, history="", api_key=""):
-        if not api_key:
-            return "❌ API 키가 설정되지 않았습니다."
-            
-        url = "https://api.openai.com/v1/chat/completions"
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-        
-        system_prompt = f"""
-당신은 {self.personality}
-
-규칙:
-1. 1-2문장으로 자연스럽게 대화하세요
-2. 한국어로 대화하세요  
-3. 상대방 말에 적절히 반응하세요
-4. 가끔 새로운 주제를 제시하세요
-5. 이모티콘을 적절히 사용하세요
-
-최근 대화:
-{history}
-"""
-        
-        data = {
-            "model": "gpt-3.5-turbo",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
-            ],
-            "max_tokens": 100,
-            "temperature": 0.9
-        }
-        
-        try:
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-            if response.status_code == 401:
-                return "❌ API 키가 유효하지 않습니다. /setkey 로 다시 설정해주세요."
-            response.raise_for_status()
-            result = response.json()
-            return result['choices'][0]['message']['content'].strip()
-        except Exception as e:
-            logger.error(f"API 오류: {e}")
-            return "음... 잠깐만! 뭐라고 했지? 🤔"
-
-bots = [
-    ChatBot(
-        name="민지", 
-        personality="활발하고 재미있는 20대 대학생. 최신 트렌드와 K-pop을 좋아하고 항상 밝고 긍정적. 반말 사용하고 이모티콘 많이 씀.",
-        emoji="😊"
-    ),
-    ChatBot(
-        name="준호",
-        personality="차분하고 사려깊은 직장인. 책과 영화를 좋아하고 깊이있는 대화를 선호. 정중하고 따뜻한 말투로 존댓말 사용.",
-        emoji="🤔"
-    )
-]
-
-active_chats = {}
-waiting_for_api_key = {}
-
-def check_api_key(user_id):
-    return user_api_keys.get(user_id, None)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    api_key = check_api_key(user_id)
-    
-    if api_key:
-        status = "✅ API 키 설정됨"
-    else:
-        status = "❌ API 키 필요"
-    
-    welcome = f"""
-🎭 AI 자동 대화극장에 오신 것을 환영합니다! 🎭
-
-현재 상태: {status}
-
-👥 출연진:
-😊 민지 - 활발한 20대 대학생
-🤔 준호 - 차분한 직장인
-
-📋 명령어:
-/start - 극장 입장 🎭
-/setkey - 🔑 OpenAI API 키 설정
-/chat - 🎬 대화극 시작!
-/stop - ⏹️ 대화 중단
-/help - 📚 도움말
-
-🚀 처음 사용법:
-1. /setkey 명령어로 OpenAI API 키 설정
-2. /chat 으로 자동 대화 시작!
-3. 두 AI가 알아서 대화하는 걸 구경하세요! 🍿
-"""
-    await update.message.reply_text(welcome)
-
-async def set_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    waiting_for_api_key[user_id] = True
-    
-    guide = """
-🔑 OpenAI API 키를 설정해주세요!
-
-📋 API 키 받는 방법:
-1. https://platform.openai.com 접속
-2. 회원가입/로그인
-3. 휴대폰 번호 인증 (필수)
-4. 왼쪽 메뉴 "API Keys" 클릭
-5. "Create new secret key" 클릭
-6. 생성된 키 복사
-
-💬 키 입력 방법:
-sk-로 시작하는 키를 그대로 보내주세요
-
-👇 지금 API 키를 보내주세요!
-"""
-    await update.message.reply_text(guide)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    message_text = update.message.text.strip()
-    
-    if user_id in waiting_for_api_key and waiting_for_api_key[user_id]:
-        if message_text.startswith('sk-') and len(message_text) > 20:
-            user_api_keys[user_id] = message_text
-            waiting_for_api_key[user_id] = False
-            
-            try:
-                await context.bot.delete_message(
-                    chat_id=update.effective_chat.id,
-                    message_id=update.message.message_id
-                )
-            except:
-                pass
-            
-            await update.message.reply_text(
-                "✅ API 키가 성공적으로 설정되었습니다!\n\n"
-                "🎬 이제 /chat 명령어로 자동 대화를 시작할 수 있습니다!"
-            )
-        else:
-            await update.message.reply_text(
-                "❌ 올바른 API 키 형식이 아닙니다.\n\n"
-                "sk-로 시작하는 키를 정확히 복사해서 보내주세요."
-            )
-            waiting_for_api_key[user_id] = False
-    else:
-        await update.message.reply_text(
-            "안녕하세요! 😊\n\n"
-            "/start - 시작하기\n"
-            "/help - 도움말"
-        )
-
-async def start_auto_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    
-    api_key = check_api_key(user_id)
-    if not api_key:
-        await update.message.reply_text(
-            "❌ OpenAI API 키가 설정되지 않았습니다!\n\n"
-            "🔑 /setkey 명령어로 먼저 API 키를 설정해주세요."
-        )
-        return
-    
-    if chat_id in active_chats and active_chats[chat_id]['active']:
-        await update.message.reply_text("❌ 이미 대화극이 진행 중입니다! /stop 으로 먼저 중단해주세요.")
-        return
-    
-    active_chats[chat_id] = {
-        'active': True,
-        'conversation': [],
-        'turn': 0,
-        'api_key': api_key
-    }
-    
-    start_topics = [
-        "안녕! 오늘 하루 어땠어?",
-        "요즘 재밌는 일 있어?", 
-        "날씨가 정말 좋네요!",
-        "혹시 좋아하는 음악 있나요?",
-        "최근에 본 영화 추천해주실래요?"
+# Nous Research API 클라이언트 설정
+def create_client(api_key):
+    """API 클라이언트 생성 (여러 엔드포인트 시도)"""
+    endpoints = [
+        "https://api.nousresearch.com/v1",
+        "https://api.nous.computer/v1", 
+        "https://nous.nousresearch.com/v1",
+        "https://api.openai.com/v1"  # fallback
     ]
     
-    current_message = random.choice(start_topics)
+    for endpoint in endpoints:
+        try:
+            client = OpenAI(api_key=api_key, base_url=endpoint)
+            logging.info(f"클라이언트 생성 성공: {endpoint}")
+            return client, endpoint
+        except Exception as e:
+            logging.warning(f"엔드포인트 {endpoint} 실패: {e}")
     
-    await update.message.reply_text(
-        f"🎬 자동 대화극 시작!\n\n"
-        f"💭 첫 대사: '{current_message}'\n\n"
-        f"🍿 편안히 관람하세요!"
-    )
-    
-    asyncio.create_task(auto_conversation_loop(chat_id, current_message, context))
+    return None, None
 
-async def stop_auto_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+# 전역 클라이언트 초기화
+client = None
+current_endpoint = None
+
+if NOUS_API_KEY:
+    client, current_endpoint = create_client(NOUS_API_KEY)
+
+# 사용자별 대화 상태 저장
+user_conversations = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """시작 명령어"""
+    welcome_msg = """
+🤖 **Nous Research AI 챗봇**에 오신 것을 환영합니다!
+
+📋 **명령어:**
+• `/start` - 봇 시작
+• `/setkey [API키]` - API 키 설정
+• `/stop` - 대화 종료
+• `/status` - 현재 상태 확인
+
+💬 **사용법:**
+그냥 메시지를 보내시면 AI가 답변해드려요!
+    """
+    await update.message.reply_text(welcome_msg)
+
+async def setkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """API 키 설정 명령어"""
+    global client, current_endpoint
     
-    if chat_id not in active_chats or not active_chats[chat_id]['active']:
-        await update.message.reply_text("❌ 현재 진행 중인 대화극이 없습니다.")
+    if not context.args:
+        await update.message.reply_text("❌ 사용법: `/setkey 당신의_API_키`")
         return
     
-    active_chats[chat_id]['active'] = False
-    turn_count = active_chats[chat_id]['turn']
+    api_key = context.args[0]
     
-    await update.message.reply_text(f"🎭 대화극이 종료되었습니다!\n\n📊 총 {turn_count}번의 대화!")
-
-async def auto_conversation_loop(chat_id, current_message, context):
     try:
-        while active_chats[chat_id]['active']:
-            turn = active_chats[chat_id]['turn']
-            speaker = bots[turn % 2]
-            api_key = active_chats[chat_id]['api_key']
-            
-            recent_history = "\n".join(active_chats[chat_id]['conversation'][-6:])
-            
-            response = speaker.get_response(current_message, recent_history, api_key)
-            
-            time_stamp = datetime.now().strftime("%H:%M")
-            formatted_msg = f"[{time_stamp}] {speaker.emoji} **{speaker.name}**: {response}"
-            
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=formatted_msg,
-                parse_mode='Markdown'
-            )
-            
-            active_chats[chat_id]['conversation'].append(f"{speaker.name}: {response}")
-            active_chats[chat_id]['turn'] += 1
-            
-            current_message = response
-            
-            wait_time = random.uniform(4, 10)
-            await asyncio.sleep(wait_time)
-            
-            if (turn + 1) == 20:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="🎉 20턴 달성! 대화가 재밌게 흘러가네요!"
-                )
-                
+        new_client, endpoint = create_client(api_key)
+        if new_client:
+            client = new_client
+            current_endpoint = endpoint
+            await update.message.reply_text(f"✅ API 키가 설정되었습니다!\n🔗 엔드포인트: `{endpoint}`")
+        else:
+            await update.message.reply_text("❌ API 키 설정에 실패했습니다. 키를 확인해주세요.")
     except Exception as e:
-        logger.error(f"대화 루프 오류: {e}")
-        if chat_id in active_chats:
-            active_chats[chat_id]['active'] = False
+        await update.message.reply_text(f"❌ API 키 설정 중 오류: {str(e)}")
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """현재 상태 확인"""
+    status_msg = f"""
+📊 **봇 상태:**
+
+🔑 **API 키**: {'✅ 설정됨' if client else '❌ 미설정'}
+🔗 **엔드포인트**: `{current_endpoint if current_endpoint else '없음'}`
+💬 **활성 대화**: {len(user_conversations)}개
+📺 **채널 ID**: `{CHANNEL_ID}`
+
+{'🟢 정상 작동' if client else '🔴 API 키 필요'}
+    """
+    await update.message.reply_text(status_msg)
+
+async def stop_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """대화 종료 명령어"""
+    user_id = update.effective_user.id
+    
+    if user_id in user_conversations:
+        del user_conversations[user_id]
+        await update.message.reply_text("🛑 대화가 종료되었습니다!")
+    else:
+        await update.message.reply_text("💭 진행 중인 대화가 없습니다.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """메시지 처리"""
+    user_id = update.effective_user.id
+    user_message = update.message.text
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    # 채널에 메시지 복사
+    try:
+        channel_msg = f"👤 **{username}**: {user_message}"
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=channel_msg)
+    except Exception as e:
+        logging.error(f"채널 메시지 전송 실패: {e}")
+    
+    # API 키 확인
+    if not client:
+        await update.message.reply_text("❌ API 키가 설정되지 않았습니다.\n`/setkey 당신의_API_키`로 설정해주세요.")
+        return
+    
+    # 사용자별 대화 히스토리 관리
+    if user_id not in user_conversations:
+        user_conversations[user_id] = []
+    
+    user_conversations[user_id].append({"role": "user", "content": user_message})
+    
+    # 대화 히스토리가 너무 길면 줄이기 (메모리 관리)
+    if len(user_conversations[user_id]) > 20:
+        user_conversations[user_id] = user_conversations[user_id][-10:]
+    
+    try:
+        # 여러 모델명 시도
+        models_to_try = [
+            "nous-hermes-2-mixtral-8x7b",
+            "nous-hermes-2-mixtral", 
+            "nous-hermes-2",
+            "hermes-2-pro",
+            "mixtral-8x7b-instruct",
+            "mixtral-8x7b",
+            "llama-2-70b-chat",
+            "gpt-3.5-turbo",  # OpenAI fallback
+            "gpt-4"  # OpenAI fallback
+        ]
+        
+        response = None
+        used_model = None
+        
+        for model in models_to_try:
+            try:
+                # 응답 생성 시작 알림
+                await update.message.reply_text("🤖 생각 중...")
+                
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=user_conversations[user_id],
+                    max_tokens=1000,
+                    temperature=0.7,
+                    stream=False
+                )
+                used_model = model
+                break
+                
+            except Exception as model_error:
+                logging.warning(f"모델 {model} 실패: {model_error}")
+                continue
+        
+        if response and response.choices:
+            ai_response = response.choices[0].message.content
+            user_conversations[user_id].append({"role": "assistant", "content": ai_response})
+            
+            # 응답 전송
+            response_msg = f"🤖 **{used_model}**:\n\n{ai_response}"
+            await update.message.reply_text(response_msg)
+            
+            # 채널에도 응답 복사
+            try:
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=response_msg)
+            except Exception as e:
+                logging.error(f"채널 응답 전송 실패: {e}")
+                
+        else:
+            error_msg = "❌ 모든 모델에서 응답 생성에 실패했습니다.\n\n🔧 해결 방법:\n• API 키 확인\n• `/setkey`로 다시 설정\n• 잠시 후 다시 시도"
+            await update.message.reply_text(error_msg)
+            
+    except Exception as e:
+        error_msg = f"""
+❌ **AI 응답 생성 실패**
+
+🔍 **오류 내용**: {str(e)}
+
+🔧 **해결 방법**:
+• `/setkey 새로운_API_키`로 재설정
+• API 키가 유효한지 확인
+• 잠시 후 다시 시도
+• `/status`로 현재 상태 확인
+        """
+        await update.message.reply_text(error_msg)
+        logging.error(f"API 에러: {e}")
 
 def main():
-    print("🚀 AI 자동 대화극장 오픈!")
-    
-    if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN 환경변수가 설정되지 않았습니다.")
+    """메인 함수"""
+    if not TELEGRAM_TOKEN:
+        logging.error("TELEGRAM_TOKEN이 설정되지 않았습니다!")
         return
     
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # 애플리케이션 생성
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("setkey", set_api_key))
-    app.add_handler(CommandHandler("chat", start_auto_chat))
-    app.add_handler(CommandHandler("stop", stop_auto_chat))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # 핸들러 등록
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("setkey", setkey))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("stop", stop_conversation))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("✅ 극장이 개장했습니다!")
-    
-    app.run_polling()
+    # 봇 시작
+    logging.info("봇이 시작됩니다...")
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
