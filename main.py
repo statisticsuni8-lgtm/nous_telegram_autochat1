@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import random
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 # 로깅 설정
 logging.basicConfig(
@@ -28,14 +28,25 @@ class UserSession:
         self.last_responses = []
         self.start_time = None
         self.current_task = None
+        self.preferred_model = "Hermes-3-Llama-3.1-405B"  # 기본은 405B
+        self.fallback_model = "Hermes-3-Llama-3.1-70B"   # 폴백은 70B
+        self.current_model = None  # 현재 실제 사용 중인 모델
+        self.model_attempts = {"405B": 0, "70B": 0}  # 모델별 시도 횟수
+        self.model_successes = {"405B": 0, "70B": 0}  # 모델별 성공 횟수
 
 class BotChatSystem:
     def __init__(self):
         self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.user_sessions: Dict[int, UserSession] = {}  # 사용자별 세션 저장
+        self.user_sessions: Dict[int, UserSession] = {}
         
         # 실제 Nous Research API 설정
         self.api_base_url = "https://inference-api.nousresearch.com/v1"
+        
+        # 사용 가능한 모델들
+        self.available_models = {
+            "405B": "Hermes-3-Llama-3.1-405B",
+            "70B": "Hermes-3-Llama-3.1-70B"
+        }
         
         # 다양한 대화 주제들 🎯
         self.starter_topics = {
@@ -117,15 +128,69 @@ class BotChatSystem:
             logger.info(f"새 사용자 세션 생성: {chat_id}")
         return self.user_sessions[chat_id]
 
-    async def test_nous_api(self, api_key: str):
-        """Nous Research API 연결 테스트"""
+    async def try_api_call(self, user_session: UserSession, data: dict) -> Tuple[bool, str, str]:
+        """
+        API 호출 시도 (405B → 70B 순서로)
+        Returns: (성공여부, 응답내용, 사용된모델)
+        """
         headers = {
-            'Authorization': f'Bearer {api_key}',
+            'Authorization': f'Bearer {user_session.nous_api_key}',
             'Content-Type': 'application/json'
         }
         
+        # 405B 먼저 시도
+        models_to_try = [
+            ("405B", self.available_models["405B"]),
+            ("70B", self.available_models["70B"])
+        ]
+        
+        for model_name, model_id in models_to_try:
+            try:
+                user_session.model_attempts[model_name] += 1
+                data_copy = data.copy()
+                data_copy["model"] = model_id
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.api_base_url}/chat/completions",
+                        headers=headers,
+                        json=data_copy,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        
+                        if response.status == 200:
+                            result = await response.json()
+                            content = result.get('choices', [{}])[0].get('message', {}).get('content', 'No response')
+                            user_session.model_successes[model_name] += 1
+                            user_session.current_model = model_id
+                            
+                            # 405B 성공시 로그
+                            if model_name == "405B":
+                                logger.info(f"사용자 {user_session.chat_id}: 405B 모델 성공")
+                            elif model_name == "70B":
+                                logger.info(f"사용자 {user_session.chat_id}: 405B 실패 → 70B 폴백 성공")
+                            
+                            return True, content.strip(), model_id
+                        else:
+                            error_text = await response.text()
+                            logger.warning(f"사용자 {user_session.chat_id}: {model_name} 모델 실패 (HTTP {response.status})")
+                            
+                            # 405B 실패시 70B로 계속, 70B도 실패시 에러 반환
+                            if model_name == "70B":
+                                return False, f"모든 모델 실패: {error_text}", None
+                            continue
+                            
+            except Exception as e:
+                logger.error(f"사용자 {user_session.chat_id}: {model_name} 모델 호출 오류: {e}")
+                if model_name == "70B":
+                    return False, f"API 호출 실패: {str(e)}", None
+                continue
+        
+        return False, "모든 모델 시도 실패", None
+
+    async def test_nous_api(self, api_key: str) -> Tuple[bool, str]:
+        """Nous Research API 연결 테스트 (405B → 70B 순서로)"""
         data = {
-            "model": "Hermes-3-Llama-3.1-70B",
             "messages": [
                 {"role": "user", "content": "안녕! 간단히 인사해줘."}
             ],
@@ -133,25 +198,17 @@ class BotChatSystem:
             "temperature": 0.7
         }
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.api_base_url}/chat/completions",
-                    headers=headers,
-                    json=data,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    
-                    if response.status == 200:
-                        result = await response.json()
-                        return True, result.get('choices', [{}])[0].get('message', {}).get('content', 'Test successful')
-                    else:
-                        response_text = await response.text()
-                        return False, f"HTTP {response.status}: {response_text}"
-                        
-        except Exception as e:
-            logger.error(f"API 테스트 오류: {e}")
-            return False, f"연결 오류: {str(e)}"
+        # 임시 세션 생성
+        temp_session = UserSession(0)
+        temp_session.nous_api_key = api_key
+        
+        success, response, model_used = await self.try_api_call(temp_session, data)
+        
+        if success:
+            model_name = "405B" if "405B" in model_used else "70B"
+            return True, f"{response} (사용 모델: {model_name})"
+        else:
+            return False, response
 
     def is_repetitive_response(self, user_session: UserSession, response: str):
         """무한 루프 방지: 반복적인 응답 체크"""
@@ -165,15 +222,10 @@ class BotChatSystem:
         return False
 
     async def call_nous_api(self, user_session: UserSession, message: str, bot_info: dict):
-        """Nous Research API 호출"""
+        """Nous Research API 호출 (405B → 70B 자동 폴백)"""
         if not user_session.nous_api_key:
             return "API 키가 설정되지 않았습니다."
             
-        headers = {
-            'Authorization': f'Bearer {user_session.nous_api_key}',
-            'Content-Type': 'application/json'
-        }
-        
         system_content = f"""당신은 {bot_info['persona']}입니다. 
 
 스타일: {bot_info['style']}
@@ -194,34 +246,18 @@ class BotChatSystem:
         messages.append({"role": "user", "content": message})
         
         data = {
-            "model": "Hermes-3-Llama-3.1-70B",
             "messages": messages,
             "temperature": random.uniform(0.7, 0.9),
             "max_tokens": 512,
             "top_p": 0.9
         }
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.api_base_url}/chat/completions",
-                    headers=headers,
-                    json=data,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    
-                    if response.status == 200:
-                        result = await response.json()
-                        content = result.get('choices', [{}])[0].get('message', {}).get('content', 'No response')
-                        return content.strip()
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"API 오류 {response.status}: {error_text}")
-                        return f"API 오류 ({response.status})"
-                        
-        except Exception as e:
-            logger.error(f"API 호출 오류: {e}")
-            return f"API 호출 실패: {str(e)}"
+        success, response, model_used = await self.try_api_call(user_session, data)
+        
+        if success:
+            return response
+        else:
+            return f"API 오류: {response}"
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """시작 명령어"""
@@ -229,15 +265,20 @@ class BotChatSystem:
         user_session = self.get_user_session(chat_id)
         
         await update.message.reply_text(
-            f"🤖 **다중 사용자 무한 AI 대화 봇** 🤖\n\n"
-            f"👥 **다중 사용자 지원!** 여러 명이 동시에 사용 가능\n"
+            f"🤖 **스마트 다중 사용자 무한 AI 대화 봇** 🤖\n\n"
+            f"🧠 **지능형 모델 선택:**\n"
+            f"• 1순위: **Hermes-3-405B** (최고 성능)\n"
+            f"• 2순위: **Hermes-3-70B** (자동 폴백)\n"
+            f"• 실시간 자동 전환으로 안정성 보장!\n\n"
+            f"👥 **다중 사용자 지원!** 동시 사용 가능\n"
             f"🆔 당신의 세션 ID: `{chat_id}`\n\n"
             f"📋 **사용법:**\n"
             f"1️⃣ Nous Research API 키를 메시지로 보내주세요\n\n"
             f"🎮 **명령어:**\n"
             f"• `/start_chat` - 🚀 무한 대화 시작\n"
             f"• `/stop_chat` - ⏹️ 대화 중지\n"
-            f"• `/status` - 📊 현재 상태\n"
+            f"• `/status` - 📊 내 상태 확인\n"
+            f"• `/model_stats` - 🧠 모델 사용 통계\n"
             f"• `/clear` - 🗑️ 대화 기록 초기화\n"
             f"• `/help` - ❓ 도움말\n"
             f"• `/global_status` - 🌍 전체 사용자 현황\n\n"
@@ -245,8 +286,51 @@ class BotChatSystem:
             f"• 6명의 다양한 AI 페르소나\n"
             f"• 5가지 주제 카테고리\n"
             f"• 최대 50,000개 메시지 지원\n"
-            f"• 사용자별 독립적인 세션\n\n"
+            f"• 지능형 모델 폴백 시스템\n\n"
             f"🔑 API 키를 먼저 설정해주세요!",
+            parse_mode='Markdown'
+        )
+
+    async def model_stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """모델 사용 통계 명령어"""
+        chat_id = update.effective_chat.id
+        user_session = self.get_user_session(chat_id)
+        
+        total_attempts = sum(user_session.model_attempts.values())
+        total_successes = sum(user_session.model_successes.values())
+        
+        if total_attempts == 0:
+            await update.message.reply_text(
+                f"📊 **모델 사용 통계** 📊\n\n"
+                f"🆔 세션 ID: `{chat_id}`\n"
+                f"아직 API 호출 기록이 없습니다.\n\n"
+                f"대화를 시작하면 통계가 생성됩니다!",
+                parse_mode='Markdown'
+            )
+            return
+            
+        success_rate_405b = (user_session.model_successes["405B"] / user_session.model_attempts["405B"] * 100) if user_session.model_attempts["405B"] > 0 else 0
+        success_rate_70b = (user_session.model_successes["70B"] / user_session.model_attempts["70B"] * 100) if user_session.model_attempts["70B"] > 0 else 0
+        
+        current_model_name = "405B" if user_session.current_model and "405B" in user_session.current_model else "70B" if user_session.current_model else "미설정"
+        
+        await update.message.reply_text(
+            f"📊 **모델 사용 통계** 📊\n\n"
+            f"🆔 세션 ID: `{chat_id}`\n"
+            f"🤖 현재 모델: **{current_model_name}**\n\n"
+            f"🧠 **Hermes-3-405B:**\n"
+            f"• 시도: {user_session.model_attempts['405B']}회\n"
+            f"• 성공: {user_session.model_successes['405B']}회\n"
+            f"• 성공률: {success_rate_405b:.1f}%\n\n"
+            f"⚡ **Hermes-3-70B:**\n"
+            f"• 시도: {user_session.model_attempts['70B']}회\n"
+            f"• 성공: {user_session.model_successes['70B']}회\n"
+            f"• 성공률: {success_rate_70b:.1f}%\n\n"
+            f"📈 **전체 통계:**\n"
+            f"• 총 시도: {total_attempts}회\n"
+            f"• 총 성공: {total_successes}회\n"
+            f"• 전체 성공률: {total_successes/total_attempts*100:.1f}%\n\n"
+            f"💡 405B 우선, 실패시 70B 자동 전환",
             parse_mode='Markdown'
         )
 
@@ -256,10 +340,21 @@ class BotChatSystem:
         active_users = sum(1 for session in self.user_sessions.values() if session.chat_active)
         total_messages = sum(session.chat_count for session in self.user_sessions.values())
         
+        # 전체 모델 통계
+        total_405b_attempts = sum(session.model_attempts["405B"] for session in self.user_sessions.values())
+        total_70b_attempts = sum(session.model_attempts["70B"] for session in self.user_sessions.values())
+        total_405b_successes = sum(session.model_successes["405B"] for session in self.user_sessions.values())
+        total_70b_successes = sum(session.model_successes["70B"] for session in self.user_sessions.values())
+        
         status_text = f"🌍 **전체 시스템 현황** 🌍\n\n"
-        status_text += f"👥 **총 사용자:** {total_users}명\n"
-        status_text += f"🟢 **활성 대화:** {active_users}명\n"
-        status_text += f"📝 **총 메시지:** {total_messages:,}개\n\n"
+        status_text += f"👥 **사용자 통계:**\n"
+        status_text += f"• 총 사용자: {total_users}명\n"
+        status_text += f"• 활성 대화: {active_users}명\n"
+        status_text += f"• 총 메시지: {total_messages:,}개\n\n"
+        
+        status_text += f"🧠 **모델 사용 현황:**\n"
+        status_text += f"• 405B 시도: {total_405b_attempts}회 (성공: {total_405b_successes}회)\n"
+        status_text += f"• 70B 시도: {total_70b_attempts}회 (성공: {total_70b_successes}회)\n\n"
         
         if active_users > 0:
             status_text += f"🔥 **진행 중인 대화들:**\n"
@@ -267,7 +362,8 @@ class BotChatSystem:
                 if session.chat_active:
                     duration = time.time() - session.start_time if session.start_time else 0
                     speed = session.chat_count / (duration/60) if duration > 0 else 0
-                    status_text += f"• 사용자 `{chat_id}`: {session.chat_count:,}개 ({speed:.1f}/분)\n"
+                    current_model = "405B" if session.current_model and "405B" in session.current_model else "70B"
+                    status_text += f"• 사용자 `{chat_id}`: {session.chat_count:,}개 ({speed:.1f}/분, {current_model})\n"
         
         await update.message.reply_text(status_text, parse_mode='Markdown')
 
@@ -278,9 +374,14 @@ class BotChatSystem:
             "🚀 `/start_chat` - AI들의 무한 대화 시작\n"
             "⏹️ `/stop_chat` - 대화 즉시 중지\n"
             "📊 `/status` - 나의 현재 상태\n"
+            "🧠 `/model_stats` - 모델 사용 통계\n"
             "🌍 `/global_status` - 전체 사용자 현황\n"
             "🗑️ `/clear` - 대화 기록 완전 삭제\n"
             "❓ `/help` - 이 도움말 보기\n\n"
+            "🧠 **지능형 모델 시스템:**\n"
+            "• 1순위: Hermes-3-405B (최고성능)\n"
+            "• 2순위: Hermes-3-70B (자동폴백)\n"
+            "• 실시간 상태 모니터링\n\n"
             "🎭 **AI 페르소나들:**\n"
             "🧠 알렉스 - 논리적 철학자\n"
             "🎨 루나 - 창의적 예술가\n"
@@ -288,7 +389,7 @@ class BotChatSystem:
             "🌟 소피아 - 따뜻한 상담사\n"
             "🎯 제이든 - 실용적 리더\n"
             "🌈 에바 - 자유로운 탐험가\n\n"
-            "💡 **다중 사용자:** 각자 독립적인 대화 진행!",
+            "💡 **다중 사용자:** 각자 독립적인 대화!",
             parse_mode='Markdown'
         )
 
@@ -313,7 +414,7 @@ class BotChatSystem:
             except:
                 pass
             
-            await update.message.reply_text("🔑 API 키 테스트 중... ⏳")
+            await update.message.reply_text("🔑 API 키 테스트 중... (405B → 70B 순서로 테스트) ⏳")
             
             success, test_result = await self.test_nous_api(message_text)
             
@@ -321,10 +422,11 @@ class BotChatSystem:
                 await update.message.reply_text(
                     f"✅ **API 키 설정 완료!**\n\n"
                     f"🆔 세션 ID: `{chat_id}`\n"
-                    f"🧪 테스트: {test_result}\n\n"
+                    f"🧪 테스트 결과: {test_result}\n\n"
                     f"🎮 **사용 가능한 명령어:**\n"
                     f"• `/start_chat` - 🚀 무한 대화 시작\n"
                     f"• `/status` - 📊 내 상태 확인\n"
+                    f"• `/model_stats` - 🧠 모델 통계\n"
                     f"• `/global_status` - 🌍 전체 현황\n"
                     f"• `/help` - ❓ 전체 도움말\n\n"
                     f"🎯 준비 완료! 대화를 시작해보세요!",
@@ -335,6 +437,7 @@ class BotChatSystem:
                 await update.message.reply_text(
                     f"❌ **API 키 테스트 실패**\n\n"
                     f"오류: {test_result}\n\n"
+                    f"405B와 70B 모델 모두 접근할 수 없습니다.\n"
                     f"올바른 Nous Research API 키를 다시 보내주세요.",
                     parse_mode='Markdown'
                 )
@@ -344,6 +447,7 @@ class BotChatSystem:
                     f"❌ **API 키를 먼저 설정해주세요!**\n\n"
                     f"🆔 당신의 세션: `{chat_id}`\n"
                     f"🔑 Nous Research API 키를 메시지로 보내주세요.\n\n"
+                    f"🧠 405B 모델 우선 시도, 실패시 70B 자동 전환!\n"
                     f"💡 각 사용자마다 별도의 API 키가 필요합니다!",
                     parse_mode='Markdown'
                 )
@@ -363,9 +467,11 @@ class BotChatSystem:
             return
             
         if user_session.chat_active:
+            current_model = "405B" if user_session.current_model and "405B" in user_session.current_model else "70B"
             await update.message.reply_text(
                 f"⚠️ **이미 대화가 진행 중입니다!**\n\n"
                 f"📊 현재 {user_session.chat_count}개 메시지 진행됨\n"
+                f"🤖 사용 중인 모델: {current_model}\n"
                 f"⏹️ 중지하려면 `/stop_chat` 입력",
                 parse_mode='Markdown'
             )
@@ -382,14 +488,19 @@ class BotChatSystem:
         starter_message = random.choice(self.starter_topics[topic_category])
         
         await update.message.reply_text(
-            f"🚀 **무한 대화 시작!** 🚀\n\n"
+            f"🚀 **스마트 무한 대화 시작!** 🚀\n\n"
             f"🆔 세션 ID: `{chat_id}`\n"
             f"📁 주제: **{topic_category}**\n"
             f"🎭 총 **{len(self.bot_personas)}명**의 AI 참여\n"
             f"🎯 최대 **{user_session.max_messages:,}**개 메시지\n\n"
+            f"🧠 **지능형 모델 시스템:**\n"
+            f"• 405B 모델 우선 시도\n"
+            f"• 실패시 70B 자동 전환\n"
+            f"• 실시간 성능 모니터링\n\n"
             f"🎮 **실시간 명령어:**\n"
             f"• `/stop_chat` - ⏹️ 즉시 중지\n"
-            f"• `/status` - 📊 진행 상황\n\n"
+            f"• `/status` - 📊 진행 상황\n"
+            f"• `/model_stats` - 🧠 모델 통계\n\n"
             f"💬 시작 주제: *{starter_message}*\n\n"
             f"⚡ 대화 시작됩니다...",
             parse_mode='Markdown'
@@ -416,16 +527,19 @@ class BotChatSystem:
             user_session.current_task.cancel()
             
         duration = time.time() - user_session.start_time if user_session.start_time else 0
+        current_model = "405B" if user_session.current_model and "405B" in user_session.current_model else "70B"
         
         await update.message.reply_text(
             f"⏹️ **대화 중지 완료!** ⏹️\n\n"
             f"🆔 세션 ID: `{chat_id}`\n"
+            f"🤖 마지막 사용 모델: {current_model}\n"
             f"📊 **최종 통계:**\n"
             f"• 총 메시지: **{user_session.chat_count}**개\n"
             f"• 대화 시간: **{duration/60:.1f}**분\n"
             f"• 평균 속도: **{user_session.chat_count/(duration/60):.1f}**개/분\n\n"
             f"🎮 **다음 단계:**\n"
             f"• `/start_chat` - 🚀 새 대화 시작\n"
+            f"• `/model_stats` - 🧠 모델 통계 확인\n"
             f"• `/clear` - 🗑️ 기록 초기화\n"
             f"• `/global_status` - 🌍 전체 현황",
             parse_mode='Markdown'
@@ -447,16 +561,20 @@ class BotChatSystem:
         duration = time.time() - user_session.start_time if user_session.start_time and user_session.chat_active else 0
         speed = user_session.chat_count / (duration/60) if duration > 0 else 0
         
+        current_model = "405B" if user_session.current_model and "405B" in user_session.current_model else "70B" if user_session.current_model else "미설정"
+        
         await update.message.reply_text(
             f"📊 **내 세션 상태** 📊\n\n"
             f"🆔 **세션 ID:** `{chat_id}`\n"
             f"🔑 **API:** {api_status} ({api_key_preview})\n"
             f"💬 **대화:** {chat_status}\n"
+            f"🤖 **현재 모델:** {current_model}\n"
             f"📝 **진행도:** {user_session.chat_count:,}/{user_session.max_messages:,} ({user_session.chat_count/user_session.max_messages*100:.1f}%)\n"
             f"🗂️ **히스토리:** {len(user_session.conversation_history)}개\n"
             f"⏱️ **경과시간:** {duration/60:.1f}분\n"
             f"⚡ **평균속도:** {speed:.1f}개/분\n\n"
-            f"🌍 전체 현황을 보려면 `/global_status` 입력",
+            f"🧠 **모델 통계:** `/model_stats` 확인\n"
+            f"🌍 **전체 현황:** `/global_status` 확인",
             parse_mode='Markdown'
         )
 
@@ -471,6 +589,7 @@ class BotChatSystem:
         user_session.conversation_history = []
         user_session.chat_count = 0
         user_session.last_responses = []
+        # 모델 통계는 유지 (API 키 재설정시에만 초기화)
         
         await update.message.reply_text(
             f"🗑️ **내 대화 기록 초기화 완료!** 🗑️\n\n"
@@ -479,17 +598,21 @@ class BotChatSystem:
             f"• 메시지 카운트: {old_count}개\n"
             f"• 대화 히스토리: {old_history}개\n"
             f"• 반복 방지 캐시: 초기화\n\n"
+            f"💡 **유지된 데이터:**\n"
+            f"• API 키 설정\n"
+            f"• 모델 사용 통계\n\n"
             f"✨ 깨끗한 상태로 재시작 준비 완료!\n\n"
             f"🎮 `/start_chat`으로 새로운 대화를 시작하세요!",
             parse_mode='Markdown'
         )
 
     async def run_bot_conversation(self, user_session: UserSession, starter_message: str):
-        """봇들 간의 무한 대화 실행 (사용자별)"""
+        """봇들 간의 무한 대화 실행 (사용자별, 지능형 모델 전환)"""
         try:
             current_message = starter_message
             current_bot_index = 0
             topic_change_counter = 0
+            consecutive_failures = 0  # 연속 실패 카운터
             
             while user_session.chat_active and user_session.chat_count < user_session.max_messages:
                 try:
@@ -501,12 +624,21 @@ class BotChatSystem:
                     
                     bot = self.bot_personas[current_bot_index]
                     
-                    # API 호출
+                    # API 호출 (405B → 70B 자동 전환)
                     response = await self.call_nous_api(user_session, current_message, bot)
                     
                     if not response or "API 오류" in response or "실패" in response:
-                        await asyncio.sleep(5)
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            # 3번 연속 실패시 대화 중지
+                            await self.send_message_to_user(user_session.chat_id, 
+                                "❌ **연속 API 오류로 대화를 중지합니다.**\n\n"
+                                "잠시 후 다시 시도해주세요.")
+                            break
+                        await asyncio.sleep(10)
                         continue
+                    
+                    consecutive_failures = 0  # 성공시 실패 카운터 초기화
                     
                     # 무한 루프 방지
                     if self.is_repetitive_response(user_session, response):
@@ -521,24 +653,17 @@ class BotChatSystem:
                     
                     user_session.chat_count += 1
                     
-                    # 메시지 전송
-                    display_message = f"**[{user_session.chat_count:,}/{user_session.max_messages:,}]** {bot['name']}: {response}"
+                    # 현재 사용 중인 모델 표시
+                    current_model_short = "405B" if user_session.current_model and "405B" in user_session.current_model else "70B"
                     
-                    try:
-                        app = Application.builder().token(self.bot_token).build()
-                        await app.bot.send_message(
-                            chat_id=user_session.chat_id,
-                            text=display_message,
-                            parse_mode='Markdown'
-                        )
-                    except Exception as e:
-                        try:
-                            await app.bot.send_message(
-                                chat_id=user_session.chat_id,
-                                text=f"[{user_session.chat_count:,}/{user_session.max_messages:,}] {bot['name']}: {response}"
-                            )
-                        except Exception as e2:
-                            logger.error(f"메시지 전송 오류: {e2}")
+                    # 메시지 전송
+                    display_message = f"**[{user_session.chat_count:,}/{user_session.max_messages:,}]** {bot['name']} `({current_model_short})`: {response}"
+                    
+                    success = await self.send_message_to_user(user_session.chat_id, display_message)
+                    if not success:
+                        # 마크다운 실패시 일반 텍스트로 재시도
+                        await self.send_message_to_user(user_session.chat_id, 
+                            f"[{user_session.chat_count:,}/{user_session.max_messages:,}] {bot['name']} ({current_model_short}): {response}")
                     
                     # 대화 히스토리 업데이트
                     user_session.conversation_history.append({"role": "assistant", "content": response})
@@ -555,18 +680,19 @@ class BotChatSystem:
                         current_message = f"{response} 그런데 {new_topic}"
                         topic_change_counter = 0
                     
-                    # 10000개마다 상태 리포트
-                    if user_session.chat_count % 10000 == 0:
+                    # 1000개마다 모델 통계 리포트
+                    if user_session.chat_count % 1000 == 0:
                         duration = time.time() - user_session.start_time
-                        await app.bot.send_message(
-                            chat_id=user_session.chat_id,
-                            text=f"🎯 **중간 리포트** 🎯\n\n"
-                                 f"📊 진행: {user_session.chat_count:,}개 완료!\n"
-                                 f"⏱️ 경과: {duration/3600:.1f}시간\n"
-                                 f"⚡ 속도: {user_session.chat_count/(duration/60):.1f}개/분\n\n"
-                                 f"🚀 계속 진행중...",
-                            parse_mode='Markdown'
-                        )
+                        total_405b = user_session.model_successes["405B"]
+                        total_70b = user_session.model_successes["70B"]
+                        
+                        await self.send_message_to_user(user_session.chat_id,
+                            f"📈 **진행 리포트** (#{user_session.chat_count:,}) 📈\n\n"
+                            f"⏱️ 경과: {duration/3600:.1f}시간\n"
+                            f"⚡ 속도: {user_session.chat_count/(duration/60):.1f}개/분\n"
+                            f"🧠 405B 사용: {total_405b}회\n"
+                            f"⚡ 70B 사용: {total_70b}회\n\n"
+                            f"🚀 계속 진행중...")
                     
                     await asyncio.sleep(random.uniform(2, 6))
                     
@@ -581,26 +707,35 @@ class BotChatSystem:
             user_session.chat_active = False
             duration = time.time() - user_session.start_time
             
-            try:
-                app = Application.builder().token(self.bot_token).build()
-                await app.bot.send_message(
-                    chat_id=user_session.chat_id,
-                    text=f"🏁 **대화 완료!** 🏁\n\n"
-                         f"📊 **최종 결과:**\n"
-                         f"• 총 메시지: **{user_session.chat_count:,}**개\n"
-                         f"• 소요시간: **{duration/3600:.1f}**시간\n"
-                         f"• 평균속도: **{user_session.chat_count/(duration/60):.1f}**개/분\n\n"
-                         f"🎮 **다시 시작:** `/start_chat`\n"
-                         f"🗑️ **초기화:** `/clear`",
-                    parse_mode='Markdown'
-                )
-            except:
-                pass
+            await self.send_message_to_user(user_session.chat_id,
+                f"🏁 **대화 완료!** 🏁\n\n"
+                f"📊 **최종 결과:**\n"
+                f"• 총 메시지: **{user_session.chat_count:,}**개\n"
+                f"• 소요시간: **{duration/3600:.1f}**시간\n"
+                f"• 평균속도: **{user_session.chat_count/(duration/60):.1f}**개/분\n"
+                f"• 405B 사용: {user_session.model_successes['405B']}회\n"
+                f"• 70B 사용: {user_session.model_successes['70B']}회\n\n"
+                f"🎮 **다시 시작:** `/start_chat`\n"
+                f"🧠 **모델 통계:** `/model_stats`")
                 
         except asyncio.CancelledError:
             logger.info(f"사용자 {user_session.chat_id}: 대화 완전 취소됨")
         except Exception as e:
             logger.error(f"사용자 {user_session.chat_id} 대화 실행 오류: {e}")
+
+    async def send_message_to_user(self, chat_id: int, message: str, parse_mode: str = 'Markdown') -> bool:
+        """사용자에게 메시지 전송 (에러 처리 포함)"""
+        try:
+            app = Application.builder().token(self.bot_token).build()
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=parse_mode
+            )
+            return True
+        except Exception as e:
+            logger.error(f"메시지 전송 오류 (chat_id: {chat_id}): {e}")
+            return False
 
 def main():
     """메인 함수"""
@@ -616,6 +751,7 @@ def main():
     # 핸들러 등록
     app.add_handler(CommandHandler("start", bot_system.start_command))
     app.add_handler(CommandHandler("help", bot_system.help_command))
+    app.add_handler(CommandHandler("model_stats", bot_system.model_stats_command))
     app.add_handler(CommandHandler("global_status", bot_system.global_status_command))
     app.add_handler(CommandHandler("start_chat", bot_system.start_chat_command))
     app.add_handler(CommandHandler("stop_chat", bot_system.stop_chat_command))
@@ -624,7 +760,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_system.handle_api_key))
     
     # 봇 실행
-    logger.info("🚀 다중 사용자 무한 대화 봇 시작!")
+    logger.info("🚀 스마트 다중 사용자 무한 대화 봇 시작! (405B → 70B 지능형 전환)")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == '__main__':
+    main()
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
