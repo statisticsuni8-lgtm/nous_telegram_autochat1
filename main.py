@@ -24,20 +24,19 @@ class BotChatSystem:
         self.max_messages = 100
         self.conversation_history = []
         
-        # Nous Research API 설정
-        self.api_base_url = "https://api.nousresearch.com/v1"
+        # 실제 Nous Research API 설정
+        self.api_base_url = "https://inference-api.nousresearch.com/v1"
         
     async def test_nous_api(self):
         """Nous Research API 연결 테스트"""
         headers = {
             'Authorization': f'Bearer {self.nous_api_key}',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            'Content-Type': 'application/json'
         }
         
         # 간단한 테스트 요청
         data = {
-            "model": "nous-hermes-2-mixtral-8x7b-dpo",
+            "model": "Hermes-3-Llama-3.1-70B",
             "messages": [
                 {"role": "user", "content": "Hello! This is a test."}
             ],
@@ -76,13 +75,12 @@ class BotChatSystem:
             
         headers = {
             'Authorization': f'Bearer {self.nous_api_key}',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            'Content-Type': 'application/json'
         }
         
         # 시스템 메시지와 대화 히스토리 구성
         messages = [
-            {"role": "system", "content": f"You are a helpful AI assistant named {persona}. Keep responses conversational and engaging, around 1-2 sentences."}
+            {"role": "system", "content": f"You are a helpful AI assistant named {persona}. Keep responses conversational and engaging, around 1-2 sentences. Respond in Korean when possible."}
         ]
         
         # 최근 대화 히스토리 추가 (최대 6개)
@@ -92,11 +90,10 @@ class BotChatSystem:
         messages.append({"role": "user", "content": message})
         
         data = {
-            "model": "nous-hermes-2-mixtral-8x7b-dpo",
+            "model": "Hermes-3-Llama-3.1-70B",
             "messages": messages,
-            "max_tokens": 150,
             "temperature": 0.8,
-            "top_p": 0.9
+            "max_tokens": 512
         }
         
         try:
@@ -130,7 +127,7 @@ class BotChatSystem:
             "🤖 **텔레그램 봇 무한 대화 시스템**\n\n"
             "📋 **사용법:**\n"
             "1️⃣ Nous Research API 키를 메시지로 보내주세요\n"
-            "   (예: sk-JxFCN35IwML0umIA7dQQ...)\n\n"
+            "   (실제 Nous Research inference API 키)\n\n"
             "2️⃣ 명령어:\n"
             "   • `/start_chat` - 봇 대화 시작\n"
             "   • `/stop_chat` - 대화 중지\n"
@@ -144,9 +141,11 @@ class BotChatSystem:
         """API 키 설정 및 일반 메시지 처리"""
         message_text = update.message.text.strip()
         
-        # Nous Research API 키 형식 체크 (sk- 로 시작하고 충분한 길이)
+        # Nous Research API 키 형식 체크 (일반적으로 sk- 또는 nsk-로 시작)
         is_api_key = (
-            message_text.startswith('sk-') and len(message_text) > 20
+            (message_text.startswith('sk-') and len(message_text) > 20) or
+            (message_text.startswith('nsk-') and len(message_text) > 20) or
+            (len(message_text) > 30 and not message_text.startswith('/'))  # 긴 문자열도 API 키로 간주
         )
         
         if is_api_key:
@@ -183,9 +182,8 @@ class BotChatSystem:
             if not self.nous_api_key:
                 await update.message.reply_text(
                     "❌ 먼저 Nous Research API 키를 설정해주세요!\n\n"
-                    "API 키는 'sk-'로 시작하는 긴 문자열입니다.\n"
-                    "예: sk-JxFCN35IwML0umIA7dQQ...\n\n"
-                    "https://portal.nousresearch.com/api-keys 에서 확인하세요."
+                    "API 키를 메시지로 그대로 보내주세요.\n"
+                    "보통 긴 문자열 형태입니다."
                 )
 
     async def start_chat_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -193,8 +191,7 @@ class BotChatSystem:
         if not self.nous_api_key:
             await update.message.reply_text(
                 "❌ **API 키가 설정되지 않았습니다!**\n\n"
-                "먼저 Nous Research API 키를 메시지로 보내주세요.\n"
-                "형식: sk-JxFCN35IwML0umIA7dQQ...",
+                "먼저 Nous Research API 키를 메시지로 보내주세요.",
                 parse_mode='Markdown'
             )
             return
@@ -209,7 +206,7 @@ class BotChatSystem:
         
         await update.message.reply_text(
             "🚀 **봇 대화를 시작합니다!**\n\n"
-            "🤖 Alice와 Bob이 대화를 시작합니다...\n"
+            "🤖 Alice와 Bob이 Hermes-3 모델로 대화를 시작합니다...\n"
             "⏹️ 중지하려면 `/stop_chat`을 입력하세요.",
             parse_mode='Markdown'
         )
@@ -234,14 +231,19 @@ class BotChatSystem:
         """상태 확인"""
         api_status = "✅ 설정됨" if self.nous_api_key else "❌ 미설정"
         chat_status = "🟢 진행중" if self.chat_active else "🔴 중지됨"
-        api_key_preview = f"sk-{self.nous_api_key[3:8]}..." if self.nous_api_key and self.nous_api_key.startswith('sk-') else "미설정"
+        
+        if self.nous_api_key:
+            api_key_preview = f"{self.nous_api_key[:8]}...{self.nous_api_key[-4:]}"
+        else:
+            api_key_preview = "미설정"
         
         await update.message.reply_text(
             f"📊 **현재 상태**\n\n"
             f"🔑 API 키: {api_status} ({api_key_preview})\n"
             f"💬 대화 상태: {chat_status}\n"
             f"📝 메시지 수: {self.chat_count}/{self.max_messages}\n"
-            f"🗂️ 대화 기록: {len(self.conversation_history)}개",
+            f"🗂️ 대화 기록: {len(self.conversation_history)}개\n"
+            f"🤖 모델: Hermes-3-Llama-3.1-70B",
             parse_mode='Markdown'
         )
 
