@@ -130,7 +130,7 @@ class BotChatSystem:
             "🤖 **텔레그램 봇 무한 대화 시스템**\n\n"
             "📋 **사용법:**\n"
             "1️⃣ Nous Research API 키를 메시지로 보내주세요\n"
-            "   (예: nsk-xxxxxxxxxxxxxxxxx)\n\n"
+            "   (예: sk-JxFCN35IwML0umIA7dQQ...)\n\n"
             "2️⃣ 명령어:\n"
             "   • `/start_chat` - 봇 대화 시작\n"
             "   • `/stop_chat` - 대화 중지\n"
@@ -144,8 +144,12 @@ class BotChatSystem:
         """API 키 설정 및 일반 메시지 처리"""
         message_text = update.message.text.strip()
         
-        # API 키로 보이는 경우 (nsk- 또는 sk- 로 시작하고 길이가 충분한 경우)
-        if (message_text.startswith('nsk-') or message_text.startswith('sk-')) and len(message_text) > 20:
+        # Nous Research API 키 형식 체크 (sk- 로 시작하고 충분한 길이)
+        is_api_key = (
+            message_text.startswith('sk-') and len(message_text) > 20
+        )
+        
+        if is_api_key:
             self.nous_api_key = message_text
             
             # 보안을 위해 원본 메시지 삭제 시도
@@ -179,7 +183,8 @@ class BotChatSystem:
             if not self.nous_api_key:
                 await update.message.reply_text(
                     "❌ 먼저 Nous Research API 키를 설정해주세요!\n\n"
-                    "API 키는 'nsk-'로 시작하는 긴 문자열입니다.\n"
+                    "API 키는 'sk-'로 시작하는 긴 문자열입니다.\n"
+                    "예: sk-JxFCN35IwML0umIA7dQQ...\n\n"
                     "https://portal.nousresearch.com/api-keys 에서 확인하세요."
                 )
 
@@ -188,7 +193,8 @@ class BotChatSystem:
         if not self.nous_api_key:
             await update.message.reply_text(
                 "❌ **API 키가 설정되지 않았습니다!**\n\n"
-                "먼저 Nous Research API 키를 메시지로 보내주세요.",
+                "먼저 Nous Research API 키를 메시지로 보내주세요.\n"
+                "형식: sk-JxFCN35IwML0umIA7dQQ...",
                 parse_mode='Markdown'
             )
             return
@@ -228,10 +234,11 @@ class BotChatSystem:
         """상태 확인"""
         api_status = "✅ 설정됨" if self.nous_api_key else "❌ 미설정"
         chat_status = "🟢 진행중" if self.chat_active else "🔴 중지됨"
+        api_key_preview = f"sk-{self.nous_api_key[3:8]}..." if self.nous_api_key and self.nous_api_key.startswith('sk-') else "미설정"
         
         await update.message.reply_text(
             f"📊 **현재 상태**\n\n"
-            f"🔑 API 키: {api_status}\n"
+            f"🔑 API 키: {api_status} ({api_key_preview})\n"
             f"💬 대화 상태: {chat_status}\n"
             f"📝 메시지 수: {self.chat_count}/{self.max_messages}\n"
             f"🗂️ 대화 기록: {len(self.conversation_history)}개",
@@ -252,13 +259,17 @@ class BotChatSystem:
             "최근에 재미있는 책이나 영화 본 게 있어?",
             "철학적인 질문을 하나 해볼게. 의식이란 무엇일까?",
             "우주에 대해 생각해본 적 있어? 정말 신비로운 것 같아.",
-            "창의성은 어떻게 발달시킬 수 있을까?"
+            "창의성은 어떻게 발달시킬 수 있을까?",
+            "미래에는 어떤 기술이 세상을 바꿀까?",
+            "예술과 과학의 관계에 대해서 어떻게 생각해?",
+            "행복이란 무엇인지 한번 생각해보자.",
+            "시간 여행이 가능하다면 어느 시대로 가고 싶어?"
         ]
         
         current_message = random.choice(starter_topics)
         bots = [
-            {"name": "🤖 Alice", "persona": "Alice - 창의적이고 호기심 많은"},
-            {"name": "🤖 Bob", "persona": "Bob - 논리적이고 분석적인"}
+            {"name": "🤖 Alice", "persona": "Alice - 창의적이고 호기심 많은 AI"},
+            {"name": "🤖 Bob", "persona": "Bob - 논리적이고 분석적인 AI"}
         ]
         current_bot = 0
         
@@ -280,8 +291,7 @@ class BotChatSystem:
                         app = Application.builder().token(self.bot_token).build()
                         await app.bot.send_message(
                             chat_id=self.admin_chat_id,
-                            text=f"{bot['name']}: {response}",
-                            parse_mode='Markdown'
+                            text=f"{bot['name']}: {response}"
                         )
                     except Exception as e:
                         logger.error(f"메시지 전송 오류: {e}")
